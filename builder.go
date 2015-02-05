@@ -11,24 +11,23 @@ import (
 
 // containment
 var Config struct {
-	WebhookAddress, KeyAddress, Path, RegistryPrefix, Users, SlackURL string
+	WebhookAddress, KeyAddress, CachePath, KeyPath, RegistryPrefix, Users, SlackURL string
 }
 
 func init() {
-
 	flag.StringVar(&Config.WebhookAddress, "w", ":5000", "webhook listen address")
-	flag.StringVar(&Config.KeyAddress, "k", ":5001", "key listen address")
-
-	flag.StringVar(&Config.Path, "p", "/tmp", "root path for git caches")
+	flag.StringVar(&Config.KeyAddress, "k", "127.0.0.1:5001", "key listen address")
+	flag.StringVar(&Config.CachePath, "p", "/tmp/longshore/cache", "root path for git caches")
+	flag.StringVar(&Config.KeyPath, "q", "/tmp/longshore/keys", "root path for private keys")
 	flag.StringVar(&Config.RegistryPrefix, "r", "", "registry prefix")
 	flag.StringVar(&Config.Users, "u", "", "users")
-	flag.StringVar(&Config.SlackURL, "s", os.Getenv(`SLACK_URL`), "slack URL")
+	flag.StringVar(&Config.SlackURL, "s", os.Getenv("SLACK_URL"), "slack URL")
 }
 
 func main() {
 	flag.Parse()
 
-	b := builder.NewBuilder(Config.Path, Config.RegistryPrefix, strings.Split(Config.Users, ","), Config.SlackURL)
+	b := builder.NewBuilder(Config.CachePath, Config.KeyPath, Config.RegistryPrefix, strings.Split(Config.Users, ","), Config.SlackURL)
 
 	err := make(chan error)
 

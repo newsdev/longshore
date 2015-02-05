@@ -23,15 +23,16 @@ import (
 )
 
 type Builder struct {
-	path, registryPrefix, slackURL string
-	users                          []string
-	lock                           lock.Lock
+	cachePath, keyPath, registryPrefix, slackURL string
+	users                                        []string
+	lock                                         lock.Lock
 }
 
-func NewBuilder(path, registryPrefix string, users []string, slackURL string) *Builder {
+func NewBuilder(cachePath, keyPath, registryPrefix string, users []string, slackURL string) *Builder {
 	return &Builder{
 		lock:           lock.NewMemoryLock(),
-		path:           path,
+		cachePath:      cachePath,
+		keyPath:        keyPath,
 		registryPrefix: registryPrefix,
 		users:          users,
 		slackURL:       slackURL,
@@ -69,12 +70,17 @@ func (b *Builder) userAllowed(user string) bool {
 	return false
 }
 
-func (b *Builder) exec(cwd, command string, args ...string) error {
+func (b *Builder) exec(cwd string, env map[string]string, command string, args ...string) error {
 
 	// Setup the command and try to start it.
 	cmd := exec.Command(command, args...)
 	cmd.Dir = cwd
 	cmd.Env = os.Environ()
+	for key, value := range env {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	fmt.Println(cmd.Env)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -109,11 +115,18 @@ func (b *Builder) keyGen(name string, out io.Writer) error {
 		return err
 	}
 
+	// Initialize the key directory.
+	keyDir := filepath.Join(b.keyPath, name)
+	if err := os.MkdirAll(keyDir, 0700); err != nil {
+		return err
+	}
+
 	// Private key generation process as shown here:
 	// http://golang.org/src/crypto/tls/generate_cert.go
 
 	// Open the file for writing.
-	keyOut, err := os.OpenFile("/tmp/key.pem", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyPath := filepath.Join(keyDir, "key.pem")
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -126,6 +139,22 @@ func (b *Builder) keyGen(name string, out io.Writer) error {
 	}
 
 	if err := keyOut.Close(); err != nil {
+		return err
+	}
+
+	// Open the file for writing.
+	keyWrapperPath := filepath.Join(keyDir, "ssh.sh")
+	keyWrapperOut, err := os.OpenFile(keyWrapperPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0700)
+	if err != nil {
+		return err
+	}
+
+	// Wreite the wrapper script.
+	if _, err := io.WriteString(keyWrapperOut, fmt.Sprintf("#!/bin/bash\nssh -i %s $@\n", keyPath)); err != nil {
+		return err
+	}
+
+	if err := keyWrapperOut.Close(); err != nil {
 		return err
 	}
 
@@ -150,14 +179,22 @@ func (b *Builder) build(payload Payload) error {
 	b.lock.Lock(payload.Repository.FullName)
 	defer b.lock.Unlock(payload.Repository.FullName)
 
+	// Set the git SSH environment variable.
+	gitSSH := map[string]string{
+		"GIT_SSH": filepath.Join(b.keyPath, payload.Repository.FullName, "ssh.sh"),
+	}
+
 	// Initialize the cache directory.
-	cacheDir := filepath.Join(b.path, payload.Repository.FullName)
+	cacheDir := filepath.Join(b.cachePath, payload.Repository.FullName)
 	if _, err := os.Stat(cacheDir); err != nil {
 		if os.IsNotExist(err) {
 
+			if err := os.MkdirAll(cacheDir, 0700); err != nil {
+				return err
+			}
+
 			// Establish an initial clone of the repository.
-			cmd := exec.Command("git", "clone", payload.Repository.SSHURL, cacheDir)
-			if err := cmd.Run(); err != nil {
+			if err := b.exec(cacheDir, gitSSH, "git", "clone", payload.Repository.SSHURL, "."); err != nil {
 				return err
 			}
 		} else {
@@ -166,17 +203,17 @@ func (b *Builder) build(payload Payload) error {
 	}
 
 	// Reset the cache.
-	if err := b.exec(cacheDir, "git", "fetch", "origin"); err != nil {
+	if err := b.exec(cacheDir, gitSSH, "git", "fetch", "origin"); err != nil {
 		return err
 	}
 
 	// Reset the cache.
-	if err := b.exec(cacheDir, "git", "reset", "--hard", payload.HeadCommit.ID); err != nil {
+	if err := b.exec(cacheDir, gitSSH, "git", "reset", "--hard", payload.HeadCommit.ID); err != nil {
 		return err
 	}
 
 	// Clean the cache.
-	if err := b.exec(cacheDir, "git", "clean", "-d", "-x", "-f"); err != nil {
+	if err := b.exec(cacheDir, gitSSH, "git", "clean", "-d", "-x", "-f"); err != nil {
 		return err
 	}
 
@@ -196,12 +233,12 @@ func (b *Builder) build(payload Payload) error {
 	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, payload.Repository.Name, tag)
 
 	// Try the Docker build.
-	if err := b.exec(cacheDir, "docker", "build", "-t", image, "."); err != nil {
+	if err := b.exec(cacheDir, nil, "docker", "build", "-t", image, "."); err != nil {
 		return err
 	}
 
 	// Try the Docker build.
-	if err := b.exec(cacheDir, "docker", "push", image); err != nil {
+	if err := b.exec(cacheDir, nil, "docker", "push", image); err != nil {
 		return err
 	}
 
@@ -222,15 +259,9 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Verify that this repository is one we can build.
 	if !b.userAllowed(payload.Repository.Owner.Name) {
-
-		// Report an unauthorized build request.
-		log.Printf(payload.Message("rejected build request"))
 		w.WriteHeader(401)
 		return
 	}
-
-	// Log acceptance.
-	log.Printf(payload.Message("accepted build request"))
 
 	if err := b.slackf("Received request to build *<%s|%s>*:%s.", payload.Repository.URL, payload.Repository.FullName, payload.Ref); err != nil {
 		log.Println(err)
@@ -239,7 +270,7 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	// Start a Go routine to handle the build.
 	go func() {
 		if err := b.build(payload); err != nil {
-			if err := b.slackf("Error building *<%s|%s>*:%s!\n%s", payload.Repository.URL, payload.Repository.FullName, payload.Ref, err.Error()); err != nil {
+			if err := b.slackf("Error building *<%s|%s>*:%s!\n_%s_", payload.Repository.URL, payload.Repository.FullName, payload.Ref, err.Error()); err != nil {
 				log.Println(err)
 			}
 		} else {
@@ -270,11 +301,11 @@ func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
 
 	name := strings.Join(components[1:], "/")
 	if err := b.keyGen(name, w); err != nil {
-		if err := b.slackf("Error adding a :key: for *<https://github.com/%s|%s>*!\n_%s_", name, name, err.Error()); err != nil {
+		if err := b.slackf("Error setting a :key: for *<https://github.com/%s|%s>*!\n_%s_", name, name, err.Error()); err != nil {
 			log.Println(err)
 		}
 	} else {
-		if err := b.slackf("Added a :key: for *<https://github.com/%s|%s>*.", name, name); err != nil {
+		if err := b.slackf("Set a new :key: for *<https://github.com/%s|%s>*.", name, name); err != nil {
 			log.Println(err)
 		}
 	}

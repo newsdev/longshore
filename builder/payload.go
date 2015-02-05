@@ -33,14 +33,6 @@ type Payload struct {
 	Pusher     User       `json:"pusher"`
 }
 
-func (p Payload) Message(message string) string {
-	return fmt.Sprintf("%s:%s %s %s %% ", p.Repository.FullName, strings.TrimPrefix(p.Ref, `refs/`), p.HeadCommit.ID[len(p.HeadCommit.ID)-10:], message)
-}
-
-func (p Payload) LogPrefix() string {
-	return fmt.Sprintf("\033[1;34m%s\033[0m \033[4;34m%s\033[0m\033[34m:%s\033[0m ", p.HeadCommit.ID[len(p.HeadCommit.ID)-10:], p.Repository.FullName, strings.TrimPrefix(p.Ref, `refs/`))
-}
-
 func (p Payload) Log(key string) io.Writer {
 
 	prefix := fmt.Sprintf(
