@@ -1,9 +1,15 @@
 package builder
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/ssh"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -91,6 +97,52 @@ func (b *Builder) exec(cwd, command string, args ...string) error {
 	return nil
 }
 
+func (b *Builder) keyGen(name string, out io.Writer) error {
+
+	// Get the build lock for the given repository.
+	b.lock.Lock(name)
+	defer b.lock.Unlock(name)
+
+	// Generate a new key.
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	// Private key generation process as shown here:
+	// http://golang.org/src/crypto/tls/generate_cert.go
+
+	// Open the file for writing.
+	keyOut, err := os.OpenFile("/tmp/key.pem", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+
+	// Create a block object from the private key and PEM-encode it into the
+	// file.
+	privateBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
+	if err := pem.Encode(keyOut, privateBlock); err != nil {
+		return err
+	}
+
+	if err := keyOut.Close(); err != nil {
+		return err
+	}
+
+	// Public key.
+	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return err
+	}
+
+	// Write the marshaled key to the writer.
+	if _, err := out.Write(ssh.MarshalAuthorizedKey(publicKey)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (b *Builder) build(payload Payload) error {
 
 	// Get the build lock for the given repository. All refs are built using
@@ -156,7 +208,7 @@ func (b *Builder) build(payload Payload) error {
 	return nil
 }
 
-func (b *Builder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var payload Payload
 	decoder := json.NewDecoder(r.Body)
@@ -199,6 +251,33 @@ func (b *Builder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// HTTP: Accepted.
 	w.WriteHeader(202)
+}
+
+func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
+
+	// The URL path should match a path on GitHub.
+	components := strings.Split(r.URL.Path, "/")
+	if len(components) != 3 {
+		w.WriteHeader(401)
+		return
+	}
+
+	// Verify that this repository is one we can build.
+	if !b.userAllowed(components[1]) {
+		w.WriteHeader(401)
+		return
+	}
+
+	name := strings.Join(components[1:], "/")
+	if err := b.keyGen(name, w); err != nil {
+		if err := b.slackf("Error adding a :key: for *<https://github.com/%s|%s>*!\n_%s_", name, name, err.Error()); err != nil {
+			log.Println(err)
+		}
+	} else {
+		if err := b.slackf("Added a :key: for *<https://github.com/%s|%s>*.", name, name); err != nil {
+			log.Println(err)
+		}
+	}
 }
 
 type BuilderError struct {
