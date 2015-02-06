@@ -80,7 +80,6 @@ func (b *Builder) exec(cwd string, env map[string]string, command string, args .
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	fmt.Println(cmd.Env)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

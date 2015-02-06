@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -24,6 +25,11 @@ func init() {
 	flag.StringVar(&Config.SlackURL, "s", os.Getenv("SLACK_URL"), "slack URL")
 }
 
+func status(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(200)
+	fmt.Fprint(w, "ok")
+}
+
 func main() {
 	flag.Parse()
 
@@ -33,6 +39,7 @@ func main() {
 
 	go func() {
 		mux := http.NewServeMux()
+		mux.HandleFunc("/status", status)
 		mux.HandleFunc("/", b.ServeWebhook)
 		server := &http.Server{Addr: Config.WebhookAddress, Handler: mux}
 		err <- server.ListenAndServe()
@@ -40,6 +47,7 @@ func main() {
 
 	go func() {
 		mux := http.NewServeMux()
+		mux.HandleFunc("/status", status)
 		mux.HandleFunc("/", b.ServeKey)
 		server := &http.Server{Addr: Config.KeyAddress, Handler: mux}
 		err <- server.ListenAndServe()
