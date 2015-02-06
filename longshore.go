@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -32,6 +33,10 @@ func status(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
+
+	if Config.SlackURL != "" {
+		log.Printf("Slack URL: %s", Config.SlackURL)
+	}
 
 	b := builder.NewBuilder(Config.CachePath, Config.KeyPath, Config.RegistryPrefix, strings.Split(Config.Users, ","), Config.SlackURL)
 

@@ -41,6 +41,10 @@ func NewBuilder(cachePath, keyPath, registryPrefix string, users []string, slack
 
 func (b *Builder) slackf(format string, args ...interface{}) error {
 
+	if b.slackURL == "" {
+		return nil
+	}
+
 	payload := make(map[string]string)
 	payload["text"] = fmt.Sprintf(format, args...)
 
@@ -185,7 +189,8 @@ func (b *Builder) build(payload Payload) error {
 
 	// Initialize the cache directory.
 	cacheDir := filepath.Join(b.cachePath, payload.Repository.FullName)
-	if _, err := os.Stat(cacheDir); err != nil {
+	cacheGitDir := filepath.Join(cacheDir, ".git")
+	if _, err := os.Stat(cacheGitDir); err != nil {
 		if os.IsNotExist(err) {
 
 			if err := os.MkdirAll(cacheDir, 0700); err != nil {
