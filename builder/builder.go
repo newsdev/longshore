@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -231,6 +232,35 @@ func (b *Builder) build(payload Payload) error {
 	default:
 		components := strings.Split(payload.Ref, "/")
 		tag = components[len(components)-1]
+	}
+
+	// Open the Dockerfile. If there isn't one, we need to return an error
+	// anyway.
+	dockerfile, err := os.Open(filepath.Join(cacheDir, "Dockerfile"))
+	if err != nil {
+		return err
+	}
+
+	// Scan the Dockerfile looking for "FROM" directives.
+	scanner := bufio.NewScanner(dockerfile)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		components := strings.SplitN(line, " ", 2)
+		if len(components) == 2 && components[0] == "FROM" {
+			if err := b.exec(cacheDir, nil, "docker", "pull", strings.TrimSpace(components[1])); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Check for Scanner errors.
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// Close the Dockerfile.
+	if err := dockerfile.Close(); err != nil {
+		return err
 	}
 
 	// Set the image name.
