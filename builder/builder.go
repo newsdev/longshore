@@ -7,18 +7,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/buth/longshore/lock"
 )
@@ -40,32 +36,6 @@ func NewBuilder(cachePath, keyPath, registryPrefix string, users []string, slack
 	}
 }
 
-func (b *Builder) slackf(format string, args ...interface{}) error {
-
-	if b.slackURL == "" {
-		return nil
-	}
-
-	payload := make(map[string]string)
-	payload["text"] = fmt.Sprintf(format, args...)
-
-	payloadJson, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	response, err := http.PostForm(b.slackURL, url.Values{"payload": {string(payloadJson)}})
-	if err != nil {
-		return err
-	}
-
-	if response.StatusCode >= 400 {
-		return errors.New("couldn't message Slack")
-	}
-
-	return nil
-}
-
 func (b *Builder) userAllowed(user string) bool {
 	for _, allowedUser := range b.users {
 		if allowedUser == user {
@@ -73,38 +43,6 @@ func (b *Builder) userAllowed(user string) bool {
 		}
 	}
 	return false
-}
-
-func (b *Builder) exec(cwd string, env map[string]string, command string, args ...string) error {
-
-	// Setup the command and try to start it.
-	cmd := exec.Command(command, args...)
-	cmd.Dir = cwd
-	cmd.Env = os.Environ()
-	for key, value := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	// Set a reasonable timeout.
-	go func() {
-		time.Sleep(5 * time.Minute)
-		if err := cmd.Process.Kill(); err != nil {
-			log.Println(err)
-		}
-	}()
-
-	// Wait for the command to exit, one way or another.
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (b *Builder) keyGen(name string, out io.Writer) error {
@@ -199,7 +137,7 @@ func (b *Builder) build(payload Payload) error {
 			}
 
 			// Establish an initial clone of the repository.
-			if err := b.exec(cacheDir, gitSSH, "git", "clone", payload.Repository.SSHURL, "."); err != nil {
+			if err := Exec(cacheDir, gitSSH, "git", "clone", payload.Repository.SSHURL, "."); err != nil {
 				return err
 			}
 		} else {
@@ -208,30 +146,18 @@ func (b *Builder) build(payload Payload) error {
 	}
 
 	// Reset the cache.
-	if err := b.exec(cacheDir, gitSSH, "git", "fetch", "origin"); err != nil {
+	if err := Exec(cacheDir, gitSSH, "git", "fetch", "origin"); err != nil {
 		return err
 	}
 
 	// Reset the cache.
-	if err := b.exec(cacheDir, gitSSH, "git", "reset", "--hard", payload.HeadCommit.ID); err != nil {
+	if err := Exec(cacheDir, gitSSH, "git", "reset", "--hard", payload.HeadCommit.ID); err != nil {
 		return err
 	}
 
 	// Clean the cache.
-	if err := b.exec(cacheDir, gitSSH, "git", "clean", "-d", "-x", "-f"); err != nil {
+	if err := Exec(cacheDir, gitSSH, "git", "clean", "-d", "-x", "-f"); err != nil {
 		return err
-	}
-
-	// Set a docker tag based on the git ref.
-	var tag string
-	switch payload.Ref {
-	case "refs/heads/master":
-		tag = "latest"
-	case "refs/heads/develop":
-		tag = "staging"
-	default:
-		components := strings.Split(payload.Ref, "/")
-		tag = components[len(components)-1]
 	}
 
 	// Open the Dockerfile. If there isn't one, we need to return an error
@@ -247,7 +173,7 @@ func (b *Builder) build(payload Payload) error {
 		line := strings.TrimSpace(scanner.Text())
 		components := strings.SplitN(line, " ", 2)
 		if len(components) == 2 && components[0] == "FROM" {
-			if err := b.exec(cacheDir, nil, "docker", "pull", strings.TrimSpace(components[1])); err != nil {
+			if err := Exec(cacheDir, nil, "docker", "pull", strings.TrimSpace(components[1])); err != nil {
 				return err
 			}
 		}
@@ -264,15 +190,15 @@ func (b *Builder) build(payload Payload) error {
 	}
 
 	// Set the image name.
-	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, payload.Repository.Name, tag)
+	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, payload.Repository.Name, payload.Tag())
 
 	// Try the Docker build.
-	if err := b.exec(cacheDir, nil, "docker", "build", "-t", image, "."); err != nil {
+	if err := Exec(cacheDir, nil, "docker", "build", "-t", image, "."); err != nil {
 		return err
 	}
 
 	// Try the Docker build.
-	if err := b.exec(cacheDir, nil, "docker", "push", image); err != nil {
+	if err := Exec(cacheDir, nil, "docker", "push", image); err != nil {
 		return err
 	}
 
@@ -297,18 +223,51 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := b.slackf("Received request to build *<%s|%s>*:%s.", payload.Repository.URL, payload.Repository.FullName, payload.Ref); err != nil {
+	messageReceived := &Message{Text: fmt.Sprintf("Starting a new build in response to a push from <https://github.com/%s|%s>.", payload.Pusher.Name, payload.Pusher.Name)}
+	messageReceived.Attatch(payload.Attatchment())
+	if err := messageReceived.Send(b.slackURL); err != nil {
 		log.Println(err)
 	}
 
 	// Start a Go routine to handle the build.
 	go func() {
 		if err := b.build(payload); err != nil {
-			if err := b.slackf("Error building *<%s|%s>*:%s!\n_%s_", payload.Repository.URL, payload.Repository.FullName, payload.Ref, err.Error()); err != nil {
+			messageErr := &Message{Text: "Caught an error during a build."}
+			messageErr.Attatch(payload.Attatchment())
+
+			if execErr, ok := err.(ExecError); ok {
+				messageErr.Attatch(execErr.Attatchment())
+			} else {
+				// TODO: Handle non-exec errors.
+			}
+
+			if err := messageErr.Send(b.slackURL); err != nil {
 				log.Println(err)
 			}
 		} else {
-			if err := b.slackf("Successfully built and pushed *<%s|%s>*:%s!", payload.Repository.URL, payload.Repository.FullName, payload.Ref); err != nil {
+			messageErr := &Message{Text: "Successfully built an image and pushed it to your Docker registry!"}
+			messageErr.Attatch(payload.Attatchment())
+			messageErr.Attatch(&Attatchment{
+				AuthorName: "Docker Registry",
+				AuthorIcon: "https://d3oypxn00j2a10.cloudfront.net/0.14.4/img/universal/official-repository-icon.png",
+				Title:      fmt.Sprintf("%s/%s", b.registryPrefix, payload.Repository.Name),
+				Text:       fmt.Sprintf("To pull the updated image:\n```\ndocker pull %s/%s:%s\n```", b.registryPrefix, payload.Repository.Name, payload.Tag()),
+				MarkdownIn: []string{"text"},
+				Fields: []*Field{
+					&Field{
+						Title: "Docker Image",
+						Value: fmt.Sprintf("%s/%s", b.registryPrefix, payload.Repository.Name),
+						Short: true,
+					},
+					&Field{
+						Title: "Docker Tag",
+						Value: payload.Tag(),
+						Short: true,
+					},
+				},
+			})
+
+			if err := messageErr.Send(b.slackURL); err != nil {
 				log.Println(err)
 			}
 		}
@@ -323,7 +282,7 @@ func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
 	// The URL path should match a path on GitHub.
 	components := strings.Split(r.URL.Path, "/")
 	if len(components) != 3 {
-		w.WriteHeader(401)
+		w.WriteHeader(400)
 		return
 	}
 
@@ -334,19 +293,27 @@ func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := strings.Join(components[1:], "/")
+	message := NewMessage()
 	if err := b.keyGen(name, w); err != nil {
-		if err := b.slackf("Error setting a :key: for *<https://github.com/%s|%s>*!\n_%s_", name, name, err.Error()); err != nil {
-			log.Println(err)
+		message.Text = fmt.Sprintf("Caught an error setting a :key: for *%s*.", name)
+
+		if execErr, ok := err.(ExecError); ok {
+			message.Attatch(execErr.Attatchment())
+		} else {
+			// TODO: Handle non-exec errors.
 		}
 	} else {
-		if err := b.slackf("Set a new :key: for *<https://github.com/%s|%s>*.", name, name); err != nil {
-			log.Println(err)
-		}
+		message.Text = fmt.Sprintf("Set a new :key: for *%s*!", name)
+	}
+
+	// Send the message.
+	if err := message.Send(b.slackURL); err != nil {
+		log.Println(err)
 	}
 }
 
 type BuilderError struct {
-	err, output string
+	err, command, output string
 }
 
 func (b BuilderError) Error() string {
