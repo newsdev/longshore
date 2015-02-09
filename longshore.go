@@ -13,7 +13,7 @@ import (
 
 // containment
 var Config struct {
-	WebhookAddress, KeyAddress, CachePath, KeyPath, RegistryPrefix, Users, SlackURL string
+	WebhookAddress, KeyAddress, CachePath, KeyPath, RegistryPrefix, Users, Branches, SlackURL string
 }
 
 func init() {
@@ -23,6 +23,7 @@ func init() {
 	flag.StringVar(&Config.KeyPath, "q", "/tmp/longshore/keys", "root path for private keys")
 	flag.StringVar(&Config.RegistryPrefix, "r", "", "registry prefix")
 	flag.StringVar(&Config.Users, "u", "", "users")
+	flag.StringVar(&Config.Users, "b", "master,develop", "branches")
 	flag.StringVar(&Config.SlackURL, "s", os.Getenv("SLACK_URL"), "slack URL")
 }
 
@@ -38,7 +39,7 @@ func main() {
 		log.Printf("Slack URL: %s", Config.SlackURL)
 	}
 
-	b := builder.NewBuilder(Config.CachePath, Config.KeyPath, Config.RegistryPrefix, strings.Split(Config.Users, ","), Config.SlackURL)
+	b := builder.NewBuilder(Config.CachePath, Config.KeyPath, Config.RegistryPrefix, strings.Split(Config.Users, ","), strings.Split(Config.Branches, ","), Config.SlackURL)
 
 	err := make(chan error)
 

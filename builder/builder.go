@@ -21,17 +21,18 @@ import (
 
 type Builder struct {
 	cachePath, keyPath, registryPrefix, slackURL string
-	users                                        []string
+	users, branches                              []string
 	lock                                         lock.Lock
 }
 
-func NewBuilder(cachePath, keyPath, registryPrefix string, users []string, slackURL string) *Builder {
+func NewBuilder(cachePath, keyPath, registryPrefix string, users, branches []string, slackURL string) *Builder {
 	return &Builder{
 		lock:           lock.NewMemoryLock(),
 		cachePath:      cachePath,
 		keyPath:        keyPath,
 		registryPrefix: registryPrefix,
 		users:          users,
+		branches:       branches,
 		slackURL:       slackURL,
 	}
 }
@@ -39,6 +40,15 @@ func NewBuilder(cachePath, keyPath, registryPrefix string, users []string, slack
 func (b *Builder) userAllowed(user string) bool {
 	for _, allowedUser := range b.users {
 		if allowedUser == user {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Builder) branchAllowed(branch string) bool {
+	for _, allowedBranch := range b.branches {
+		if allowedBranch == branch {
 			return true
 		}
 	}
