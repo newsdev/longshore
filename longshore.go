@@ -23,7 +23,7 @@ func init() {
 	flag.StringVar(&Config.KeyPath, "q", "/tmp/longshore/keys", "root path for private keys")
 	flag.StringVar(&Config.RegistryPrefix, "r", "", "registry prefix")
 	flag.StringVar(&Config.Users, "u", "", "users")
-	flag.StringVar(&Config.Users, "b", "master,develop", "branches")
+	flag.StringVar(&Config.Branches, "b", "master,develop", "branches")
 	flag.StringVar(&Config.SlackURL, "s", os.Getenv("SLACK_URL"), "slack URL")
 }
 

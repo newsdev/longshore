@@ -233,6 +233,13 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is one of the branches we are supposed to build. This is to
+	// say, tags are never built.
+	if !b.branchAllowed(payload.Branch()) {
+		w.WriteHeader(200)
+		return
+	}
+
 	messageReceived := &Message{Text: fmt.Sprintf("Starting a new build in response to a push from <https://github.com/%s|%s>.", payload.Pusher.Name, payload.Pusher.Name)}
 	messageReceived.Attatch(payload.Attatchment())
 	if err := messageReceived.Send(b.slackURL); err != nil {
