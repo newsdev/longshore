@@ -21,15 +21,8 @@ import (
 )
 
 const (
-	DockerIgnore = `.dockerignore
-.DS_Store
-.git
+	DockerIgnore = `.git
 .gitignore
-.ruby*
-Dockerfile
-Makefile
-README*
-tmp
 `
 )
 
