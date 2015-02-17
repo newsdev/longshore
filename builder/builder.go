@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +18,19 @@ import (
 	"strings"
 
 	"github.com/buth/longshore/lock"
+)
+
+const (
+	DockerIgnore = `.dockerignore
+.DS_Store
+.git
+.gitignore
+.ruby*
+Dockerfile
+Makefile
+README*
+tmp
+`
 )
 
 type Builder struct {
@@ -175,6 +189,18 @@ func (b *Builder) build(payload Payload) error {
 	dockerfile, err := os.Open(filepath.Join(cacheDir, "Dockerfile"))
 	if err != nil {
 		return err
+	}
+
+	// Check for a .dockerignore file.
+	dockerignore := filepath.Join(cacheDir, ".dockerignore")
+	if _, err := os.Stat(dockerignore); err != nil {
+		if os.IsNotExist(err) {
+			if err := ioutil.WriteFile(dockerignore, []byte(DockerIgnore), 0644); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
 	// Scan the Dockerfile looking for "FROM" directives.
