@@ -4,7 +4,7 @@ release: bin/longshore
 	aws s3 cp bin/longshore s3://newsdev-pub/bin/longshore
 
 bin/longshore: bin
-	docker build -t longshore-build $(CURDIR) && docker run --rm -v $(CURDIR)/bin:/opt/bin longshore-build cp /go/bin/app /opt/bin/longshore
+	docker build -t longshore-build $(CURDIR) && docker run --rm -v $(CURDIR)/bin:/opt/bin longshore-build cp /go/bin/longshore /opt/bin/longshore
 
 bin:
 	mkdir -p bin
