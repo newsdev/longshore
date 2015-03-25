@@ -35,10 +35,6 @@ func status(w http.ResponseWriter, r *http.Request) {
 func main() {
 	flag.Parse()
 
-	if Config.SlackURL != "" {
-		log.Printf("Slack URL: %s", Config.SlackURL)
-	}
-
 	b := builder.NewBuilder(Config.CachePath, Config.KeyPath, Config.RegistryPrefix, strings.Split(Config.Users, ","), strings.Split(Config.Branches, ","), Config.SlackURL)
 
 	err := make(chan error)

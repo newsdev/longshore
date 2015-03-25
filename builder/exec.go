@@ -2,15 +2,19 @@ package builder
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"time"
 )
 
 const (
-	ExecTimeout = 5 * time.Minute
+	ExecTimeout = 15 * time.Minute
+)
+
+var (
+	timeoutError = errors.New("process timed out")
 )
 
 func Exec(cwd string, env map[string]string, command string, args ...string) error {
@@ -34,21 +38,33 @@ func Exec(cwd string, env map[string]string, command string, args ...string) err
 		return NewExecError(command, args, err, output.String())
 	}
 
+	// Make an error channel.
+	errSignal := make(chan error)
+
 	// Set a reasonable timeout.
 	go func() {
 		time.Sleep(ExecTimeout)
 		if !cmd.ProcessState.Exited() {
 			if err := cmd.Process.Kill(); err != nil {
-
-				// There's no one to tell, so just log it out.
-				log.Println(err)
+				errSignal <- NewExecError(command, args, err, output.String())
+			} else {
+				errSignal <- NewExecError(command, args, timeoutError, output.String())
 			}
 		}
 	}()
 
-	// Wait for the command to exit, one way or another.
-	if err := cmd.Wait(); err != nil {
-		return NewExecError(command, args, err, output.String())
+	go func() {
+
+		// Wait for the command to exit, one way or another.
+		if err := cmd.Wait(); err != nil {
+			errSignal <- NewExecError(command, args, err, output.String())
+		} else {
+			errSignal <- nil
+		}
+	}()
+
+	if err := <-errSignal; err != nil {
+		return err
 	}
 
 	return nil

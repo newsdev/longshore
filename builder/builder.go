@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
 	"log"
@@ -17,6 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/crypto/ssh"
+
+	"github.com/buth/longshore/github"
 	"github.com/buth/longshore/lock"
 )
 
@@ -131,20 +133,20 @@ func (b *Builder) keyGen(name string, out io.Writer) error {
 	return nil
 }
 
-func (b *Builder) build(payload Payload) error {
+func (b *Builder) build(fullName, name, cloneURL, commit, tag string) error {
 
 	// Get the build lock for the given repository. All refs are built using
 	// the same lock.
-	b.lock.Lock(payload.Repository.FullName)
-	defer b.lock.Unlock(payload.Repository.FullName)
+	b.lock.Lock(fullName)
+	defer b.lock.Unlock(fullName)
 
 	// Set the git SSH environment variable.
 	gitSSH := map[string]string{
-		"GIT_SSH": filepath.Join(b.keyPath, payload.Repository.FullName, "ssh.sh"),
+		"GIT_SSH": filepath.Join(b.keyPath, fullName, "ssh.sh"),
 	}
 
 	// Initialize the cache directory.
-	cacheDir := filepath.Join(b.cachePath, payload.Repository.FullName)
+	cacheDir := filepath.Join(b.cachePath, fullName)
 	cacheGitDir := filepath.Join(cacheDir, ".git")
 	if _, err := os.Stat(cacheGitDir); err != nil {
 		if os.IsNotExist(err) {
@@ -154,7 +156,7 @@ func (b *Builder) build(payload Payload) error {
 			}
 
 			// Establish an initial clone of the repository.
-			if err := Exec(cacheDir, gitSSH, "git", "clone", payload.Repository.SSHURL, "."); err != nil {
+			if err := Exec(cacheDir, gitSSH, "git", "clone", cloneURL, "."); err != nil {
 				return err
 			}
 		} else {
@@ -168,7 +170,7 @@ func (b *Builder) build(payload Payload) error {
 	}
 
 	// Reset the cache.
-	if err := Exec(cacheDir, gitSSH, "git", "reset", "--hard", payload.HeadCommit.ID); err != nil {
+	if err := Exec(cacheDir, gitSSH, "git", "reset", "--hard", commit); err != nil {
 		return err
 	}
 
@@ -182,18 +184,6 @@ func (b *Builder) build(payload Payload) error {
 	dockerfile, err := os.Open(filepath.Join(cacheDir, "Dockerfile"))
 	if err != nil {
 		return err
-	}
-
-	// Check for a .dockerignore file.
-	dockerignore := filepath.Join(cacheDir, ".dockerignore")
-	if _, err := os.Stat(dockerignore); err != nil {
-		if os.IsNotExist(err) {
-			if err := ioutil.WriteFile(dockerignore, []byte(DockerIgnore), 0644); err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
 	}
 
 	// Scan the Dockerfile looking for "FROM" directives.
@@ -218,8 +208,20 @@ func (b *Builder) build(payload Payload) error {
 		return err
 	}
 
-	// Set the image name.
-	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, payload.Repository.Name, payload.Tag())
+	// Check for a .dockerignore file.
+	dockerignore := filepath.Join(cacheDir, ".dockerignore")
+	if _, err := os.Stat(dockerignore); err != nil {
+		if os.IsNotExist(err) {
+			if err := ioutil.WriteFile(dockerignore, []byte(DockerIgnore), 0600); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	// Set the full Docker image name.
+	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, name, tag)
 
 	// Try the Docker build.
 	if err := Exec(cacheDir, nil, "docker", "build", "-t", image, "."); err != nil {
@@ -236,80 +238,88 @@ func (b *Builder) build(payload Payload) error {
 
 func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 
-	var payload Payload
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&payload); err != nil {
-
-		// HTTP: Bad request.
-		fmt.Fprintf(w, "parse error: %s", err.Error())
+	// Read the payload into a byte slice.
+	payloadBytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println(err)
 		w.WriteHeader(400)
 		return
 	}
 
-	// Verify that this repository is one we can build.
-	if !b.userAllowed(payload.Repository.Owner.Name) {
+	// Attempt to parse the payload as a PullRequestEvent, returning any error
+	// as a 400 (Bad Request).
+	p := github.Payload{}
+	if err := json.Unmarshal(payloadBytes, &p); err != nil {
+		log.Println(err)
+		w.WriteHeader(400)
+		return
+	}
+
+	// Check that the owner of the repository is allowed to have builds run.
+	// Return a 401 (Unauthorized) if they are not.
+	if !b.userAllowed(p.Repository.Owner.Name) {
 		w.WriteHeader(401)
 		return
 	}
 
-	// Check if this is one of the branches we are supposed to build. This is to
-	// say, tags are never built.
-	if !b.branchAllowed(payload.Branch()) {
+	// Check whether or not this is a buildable branch.
+	var tag string
+	switch p.Branch() {
+	case "master":
+		tag = "latest"
+	case "develop":
+		tag = "staging"
+	default:
 		w.WriteHeader(200)
 		return
 	}
 
-	messageReceived := &Message{Text: fmt.Sprintf("Starting a new build in response to a push from <https://github.com/%s|%s>.", payload.Pusher.Name, payload.Pusher.Name)}
-	messageReceived.Attatch(payload.Attatchment())
-	if err := messageReceived.Send(b.slackURL); err != nil {
-		log.Println(err)
-	}
-
 	// Start a Go routine to handle the build.
 	go func() {
-		if err := b.build(payload); err != nil {
-			messageErr := &Message{Text: "Caught an error during a build."}
-			messageErr.Attatch(payload.Attatchment())
+
+		messageRecieved := NewMessage()
+		messageRecieved.Text = fmt.Sprintf("A new build request was recieved from _%s_.", p.Pusher.Name)
+		messageRecievedAttatchment := NewAttatchment()
+		messageRecievedAttatchment.Fallback = fmt.Sprintf("%s:%s (%s) → %s:staging", p.Repository.FullName, p.Branch(), p.HeadCommit.ID[:10], p.Repository.Name)
+		messageRecievedAttatchment.Text = fmt.Sprintf("*<%s|%s>*:%s (<%s|%s>) → :package: *%s*:staging", p.Repository.URL, p.Repository.FullName, p.Branch(), p.HeadCommit.URL, p.HeadCommit.ID[:10], p.Repository.Name)
+		messageRecievedAttatchment.MarkdownIn = []string{"text"}
+		messageRecieved.Attatch(messageRecievedAttatchment)
+		if err := messageRecieved.Send(b.slackURL); err != nil {
+			fmt.Printf("error: %s\n", err.Error())
+		}
+
+		// Run the build.
+		if err := b.build(p.Repository.FullName, p.Repository.Name, p.Repository.SSHURL, p.HeadCommit.ID, tag); err != nil {
+
+			messageError := NewMessage()
+			messageError.Text = fmt.Sprintf("Encountered an error while handling a build request from _%s_.", p.Pusher.Name)
+			messageError.Attatch(messageRecievedAttatchment)
 
 			if execErr, ok := err.(ExecError); ok {
-				messageErr.Attatch(execErr.Attatchment())
+				messageError.Attatch(execErr.Attatchment())
 			} else {
-				// TODO: Handle non-exec errors.
+				messageErrorAttatchment := NewAttatchment()
+				messageErrorAttatchment.Fallback = err.Error()
+				messageErrorAttatchment.Text = fmt.Sprintf("_%s_", err.Error())
+				messageErrorAttatchment.Color = "danger"
+				messageError.Attatch(messageErrorAttatchment)
 			}
+			if err := messageError.Send(b.slackURL); err != nil {
+				fmt.Printf("error: %s\n", err.Error())
+			}
+		}
 
-			if err := messageErr.Send(b.slackURL); err != nil {
-				log.Println(err)
-			}
-		} else {
-			messageErr := &Message{Text: "Successfully built an image and pushed it to your Docker registry!"}
-			messageErr.Attatch(payload.Attatchment())
-			messageErr.Attatch(&Attatchment{
-				AuthorName: "Docker Registry",
-				AuthorIcon: "https://d3oypxn00j2a10.cloudfront.net/0.14.4/img/universal/official-repository-icon.png",
-				Title:      fmt.Sprintf("%s/%s", b.registryPrefix, payload.Repository.Name),
-				Text:       fmt.Sprintf("To pull the updated image:\n```\ndocker pull %s/%s:%s\n```", b.registryPrefix, payload.Repository.Name, payload.Tag()),
-				MarkdownIn: []string{"text"},
-				Fields: []*Field{
-					&Field{
-						Title: "Docker Image",
-						Value: fmt.Sprintf("%s/%s", b.registryPrefix, payload.Repository.Name),
-						Short: true,
-					},
-					&Field{
-						Title: "Docker Tag",
-						Value: payload.Tag(),
-						Short: true,
-					},
-				},
-			})
-
-			if err := messageErr.Send(b.slackURL); err != nil {
-				log.Println(err)
-			}
+		// Note that the build was successful.
+		messageSuccess := NewMessage()
+		messageSuccess.Text = fmt.Sprintf("Successfully processed a build request from _%s_!", p.Pusher.Name)
+		messageSuccess.Attatch(messageRecievedAttatchment)
+		if err := messageSuccess.Send(b.slackURL); err != nil {
+			fmt.Printf("error: %s\n", err.Error())
 		}
 	}()
 
-	// HTTP: Accepted.
+	// Since we've accepted the build request but have nothing to report, return
+	// a 202 (Accepted).
 	w.WriteHeader(202)
 }
 

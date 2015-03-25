@@ -54,7 +54,7 @@ func (m *Message) Send(slackURL string) error {
 		return err
 	}
 
-	response, err := http.PostForm(slackURL, url.Values{"payload": {string(payloadJson)}})
+	response, err := http.PostForm(slackURL, url.Values{"parse": {"none"}, "payload": {string(payloadJson)}})
 	if err != nil {
 		return err
 	}
