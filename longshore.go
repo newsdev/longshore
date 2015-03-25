@@ -3,7 +3,6 @@ package main // import "github.com/buth/longshore"
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
