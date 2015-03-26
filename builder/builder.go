@@ -277,12 +277,18 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	// Start a Go routine to handle the build.
 	go func() {
 
+		text := fmt.Sprintf("*<%s|%s>*:%s (<%s|%s>) → :package: *%s*:staging", p.Repository.URL, p.Repository.FullName, p.Branch(), p.HeadCommit.URL, p.HeadCommit.ID[:10], p.Repository.Name)
+
 		messageRecieved := NewMessage()
-		messageRecieved.Text = fmt.Sprintf("A new build request was recieved from _%s_.", p.Pusher.Name)
+		messageRecieved.Text = text
+
+		fmt.Sprintf("Recieved a build request based on a push from _%s_.", p.Pusher.Name)
+
 		messageRecievedAttatchment := NewAttatchment()
-		messageRecievedAttatchment.Fallback = fmt.Sprintf("%s:%s (%s) → %s:staging", p.Repository.FullName, p.Branch(), p.HeadCommit.ID[:10], p.Repository.Name)
-		messageRecievedAttatchment.Text = fmt.Sprintf("*<%s|%s>*:%s (<%s|%s>) → :package: *%s*:staging", p.Repository.URL, p.Repository.FullName, p.Branch(), p.HeadCommit.URL, p.HeadCommit.ID[:10], p.Repository.Name)
+		messageRecievedAttatchment.Fallback = fmt.Sprintf("Recieved a build request based on a push from %s.", p.Pusher.Name)
+		messageRecievedAttatchment.Text = fmt.Sprintf("Recieved a build request based on a push from _%s_.", p.Pusher.Name)
 		messageRecievedAttatchment.MarkdownIn = []string{"text"}
+
 		messageRecieved.Attatch(messageRecievedAttatchment)
 		if err := messageRecieved.Send(b.slackURL); err != nil {
 			fmt.Printf("error: %s\n", err.Error())
@@ -292,8 +298,7 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 		if err := b.build(p.Repository.FullName, p.Repository.Name, p.Repository.SSHURL, p.HeadCommit.ID, tag); err != nil {
 
 			messageError := NewMessage()
-			messageError.Text = fmt.Sprintf("Encountered an error while handling a build request from _%s_.", p.Pusher.Name)
-			messageError.Attatch(messageRecievedAttatchment)
+			messageError.Text = text
 
 			if execErr, ok := err.(ExecError); ok {
 				messageError.Attatch(execErr.Attatchment())
@@ -302,19 +307,28 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 				messageErrorAttatchment.Fallback = err.Error()
 				messageErrorAttatchment.Text = fmt.Sprintf("_%s_", err.Error())
 				messageErrorAttatchment.Color = "danger"
+				messageErrorAttatchment.MarkdownIn = []string{"text"}
 				messageError.Attatch(messageErrorAttatchment)
 			}
 			if err := messageError.Send(b.slackURL); err != nil {
 				fmt.Printf("error: %s\n", err.Error())
 			}
-		}
+		} else {
 
-		// Note that the build was successful.
-		messageSuccess := NewMessage()
-		messageSuccess.Text = fmt.Sprintf("Successfully processed a build request from _%s_!", p.Pusher.Name)
-		messageSuccess.Attatch(messageRecievedAttatchment)
-		if err := messageSuccess.Send(b.slackURL); err != nil {
-			fmt.Printf("error: %s\n", err.Error())
+			// Note that the build was successful.
+			messageSuccess := NewMessage()
+			messageSuccess.Text = text
+
+			messageSuccessAttatchment := NewAttatchment()
+			messageSuccessAttatchment.Fallback = fmt.Sprintf("Successfully processed a build request based on a push from %s!", p.Pusher.Name)
+			messageSuccessAttatchment.Text = fmt.Sprintf("Successfully processed a build request based on a push from _%s_!", p.Pusher.Name)
+			messageSuccessAttatchment.Color = "good"
+			messageSuccessAttatchment.MarkdownIn = []string{"text"}
+
+			messageSuccess.Attatch(messageSuccessAttatchment)
+			if err := messageSuccess.Send(b.slackURL); err != nil {
+				fmt.Printf("error: %s\n", err.Error())
+			}
 		}
 	}()
 
