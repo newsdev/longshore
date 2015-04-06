@@ -18,8 +18,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/buth/longshore/github"
-	"github.com/buth/longshore/lock"
+	"github.com/newsdev/longshore/github"
+	"github.com/newsdev/longshore/lock"
 )
 
 const (

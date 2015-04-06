@@ -1,4 +1,4 @@
-package main // import "github.com/buth/longshore"
+package main // import "github.com/newsdev/longshore"
 
 import (
 	"flag"
@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/buth/longshore/builder"
+	"github.com/newsdev/longshore/builder"
 )
 
 // containment
