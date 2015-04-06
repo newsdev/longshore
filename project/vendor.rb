@@ -33,3 +33,4 @@ def package(type, name, ref)
 end
 
 package :git, 'github.com/go-mgo/mgo', 'c6a7dce14133ccac2dcac3793f1d6e2ef048503a'
+package :git, 'github.com/gorilla/mux', '8096f47503459bcc74d1f4c487b7e6e42e5746b5'
