@@ -119,6 +119,7 @@ func main() {
 		g := r.Methods("GET").Subrouter()
 		g.HandleFunc("/status", status)
 		g.HandleFunc("/{user}/{repository}/build", b.ServeBuild)
+		g.HandleFunc("/{user}/{repository}/builds", b.ServeBuilds)
 
 		server := &http.Server{Addr: Config.WebhookAddress, Handler: r}
 		errs <- server.ListenAndServe()

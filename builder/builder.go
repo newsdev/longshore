@@ -437,6 +437,42 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(202)
 }
 
+func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
+
+	// Get the user and repository values from mux.
+	vars := mux.Vars(r)
+	user := vars["user"]
+	repository := vars["repository"]
+
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Find(bson.M{
+		"user":       user,
+		"repository": repository,
+	}).Sort("-updated").Limit(20).Iter()
+
+	var result []bson.M
+	if err := iter.All(&result); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if _, err := w.Write(resultBytes); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+}
+
 func (b *Builder) ServeBuild(w http.ResponseWriter, r *http.Request) {
 
 	// Get the user and repository values from mux.
