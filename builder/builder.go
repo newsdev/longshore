@@ -15,9 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/newsdev/longshore/vendor/src/github.com/go-mgo/mgo"
+	"github.com/newsdev/longshore/vendor/src/github.com/go-mgo/mgo/bson"
+
+	"github.com/gorilla/mux"
 	"github.com/newsdev/longshore/github"
 	"github.com/newsdev/longshore/lock"
 )
@@ -28,26 +33,48 @@ const (
 `
 )
 
-type Builder struct {
-	cachePath, keyPath, registryPrefix, slackURL string
-	users, branches                              []string
-	lock                                         lock.Lock
+type Config struct {
+	CachePath, KeyPath, RegistryPrefix, SlackURL string
+	Users, Branches                              []string
+	MongoDBDialInfo                              *mgo.DialInfo
 }
 
-func NewBuilder(cachePath, keyPath, registryPrefix string, users, branches []string, slackURL string) *Builder {
-	return &Builder{
-		lock:           lock.NewMemoryLock(),
-		cachePath:      cachePath,
-		keyPath:        keyPath,
-		registryPrefix: registryPrefix,
-		users:          users,
-		branches:       branches,
-		slackURL:       slackURL,
+type Builder struct {
+	config         *Config
+	mongoDBSession *mgo.Session
+	lock           lock.Lock
+}
+
+func NewBuilder(config *Config) (*Builder, error) {
+	b := &Builder{
+		config: config,
+		lock:   lock.NewMemoryLock(),
 	}
+
+	if b.config.MongoDBDialInfo != nil {
+		session, err := mgo.DialWithInfo(b.config.MongoDBDialInfo)
+		if err != nil {
+			return nil, err
+		}
+
+		buildsCollection := session.DB(b.config.MongoDBDialInfo.Database).C("builds")
+
+		buildSortIndex := mgo.Index{
+			Key: []string{"-updated", "user", "repository", "branch"},
+		}
+
+		if err := buildsCollection.EnsureIndex(buildSortIndex); err != nil {
+			return nil, err
+		}
+
+		b.mongoDBSession = session
+	}
+
+	return b, nil
 }
 
 func (b *Builder) userAllowed(user string) bool {
-	for _, allowedUser := range b.users {
+	for _, allowedUser := range b.config.Users {
 		if allowedUser == user {
 			return true
 		}
@@ -56,7 +83,7 @@ func (b *Builder) userAllowed(user string) bool {
 }
 
 func (b *Builder) branchAllowed(branch string) bool {
-	for _, allowedBranch := range b.branches {
+	for _, allowedBranch := range b.config.Branches {
 		if allowedBranch == branch {
 			return true
 		}
@@ -77,7 +104,7 @@ func (b *Builder) keyGen(name string, out io.Writer) error {
 	}
 
 	// Initialize the key directory.
-	keyDir := filepath.Join(b.keyPath, name)
+	keyDir := filepath.Join(b.config.KeyPath, name)
 	if err := os.MkdirAll(keyDir, 0700); err != nil {
 		return err
 	}
@@ -133,7 +160,135 @@ func (b *Builder) keyGen(name string, out io.Writer) error {
 	return nil
 }
 
-func (b *Builder) build(fullName, name, cloneURL, commit, tag string) error {
+func (b *Builder) Build(pusher, user, repository, branch, commit, tag string) {
+
+	repositoryURL := fmt.Sprintf("https://github.com:%s/%s", user, repository)
+	commitURL := fmt.Sprintf("https://github.com:%s/%s/commit", user, repository, commit)
+
+	if b.mongoDBSession != nil {
+		session := b.mongoDBSession.Copy()
+
+		if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
+			"pusher":     pusher,
+			"tag":        tag,
+			"status":     "pending",
+			"user":       user,
+			"repository": repository,
+			"branch":     repository,
+			"commit":     commit,
+			"updated":    time.Now(),
+		}); err != nil {
+			log.Println(err)
+		}
+
+		session.Close()
+	}
+
+	text := fmt.Sprintf("*<%s|%s/%s>*:%s (<%s|%s>) → :package: *%s*:%s", repositoryURL, user, repository, branch, commitURL, commit[:10], repository, tag)
+
+	// Send a Slack message indicating we've recieved a build request.
+	messageRecieved := NewMessage()
+	messageRecieved.Text = text
+
+	messageRecievedAttatchment := NewAttatchment()
+	messageRecievedAttatchment.Fallback = fmt.Sprintf("Recieved a build request from %s.", pusher)
+	messageRecievedAttatchment.Text = fmt.Sprintf("Recieved a build request from _%s_.", pusher)
+	messageRecievedAttatchment.MarkdownIn = []string{"text"}
+
+	messageRecieved.Attatch(messageRecievedAttatchment)
+	if err := messageRecieved.Send(b.config.SlackURL); err != nil {
+		fmt.Printf("error: %s\n", err.Error())
+	}
+
+	// Run the build.
+	if err := b.build(user, repository, commit, tag); err != nil {
+
+		// Note the error in MongoDB if necessary.
+		if b.mongoDBSession != nil {
+			session := b.mongoDBSession.Copy()
+
+			var errorOuput string
+			if execErr, ok := err.(ExecError); ok {
+				errorOuput = execErr.Output
+			}
+
+			if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
+				"pusher":      pusher,
+				"tag":         tag,
+				"status":      "error",
+				"error":       err.Error(),
+				"errorOutput": errorOuput,
+				"user":        user,
+				"repository":  repository,
+				"branch":      repository,
+				"commit":      commit,
+				"updated":     time.Now(),
+			}); err != nil {
+				log.Println(err)
+			}
+
+			session.Close()
+		}
+
+		messageError := NewMessage()
+		messageError.Text = text
+
+		if execErr, ok := err.(ExecError); ok {
+			messageError.Attatch(execErr.Attatchment())
+		} else {
+			messageErrorAttatchment := NewAttatchment()
+			messageErrorAttatchment.Fallback = err.Error()
+			messageErrorAttatchment.Text = fmt.Sprintf("_%s_", err.Error())
+			messageErrorAttatchment.Color = "danger"
+			messageErrorAttatchment.MarkdownIn = []string{"text"}
+			messageError.Attatch(messageErrorAttatchment)
+		}
+		if err := messageError.Send(b.config.SlackURL); err != nil {
+			fmt.Printf("error: %s\n", err.Error())
+		}
+	} else {
+
+		// Note the success in MongoDB if necessary.
+		if b.mongoDBSession != nil {
+			session := b.mongoDBSession.Copy()
+
+			if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
+				"pusher":     pusher,
+				"tag":        tag,
+				"status":     "success",
+				"user":       user,
+				"repository": repository,
+				"branch":     repository,
+				"commit":     commit,
+				"updated":    time.Now(),
+			}); err != nil {
+				log.Println(err)
+			}
+
+			session.Close()
+		}
+
+		// Note that the build was successful.
+		messageSuccess := NewMessage()
+		messageSuccess.Text = text
+
+		messageSuccessAttatchment := NewAttatchment()
+		messageSuccessAttatchment.Fallback = fmt.Sprintf("Successfully processed a build request from %s!", pusher)
+		messageSuccessAttatchment.Text = fmt.Sprintf("Successfully processed a build request from _%s_!", pusher)
+		messageSuccessAttatchment.Color = "good"
+		messageSuccessAttatchment.MarkdownIn = []string{"text"}
+
+		messageSuccess.Attatch(messageSuccessAttatchment)
+		if err := messageSuccess.Send(b.config.SlackURL); err != nil {
+			fmt.Printf("error: %s\n", err.Error())
+		}
+	}
+}
+
+func (b *Builder) build(user, repository, commit, tag string) error {
+
+	fullName := fmt.Sprintf("%s/%s", user, repository)
+	cloneURL := fmt.Sprintf("git@github.com:%s/%s.git", user, repository)
 
 	// Get the build lock for the given repository. All refs are built using
 	// the same lock.
@@ -142,11 +297,11 @@ func (b *Builder) build(fullName, name, cloneURL, commit, tag string) error {
 
 	// Set the git SSH environment variable.
 	gitSSH := map[string]string{
-		"GIT_SSH": filepath.Join(b.keyPath, fullName, "ssh.sh"),
+		"GIT_SSH": filepath.Join(b.config.KeyPath, fullName, "ssh.sh"),
 	}
 
 	// Initialize the cache directory.
-	cacheDir := filepath.Join(b.cachePath, fullName)
+	cacheDir := filepath.Join(b.config.CachePath, fullName)
 	cacheGitDir := filepath.Join(cacheDir, ".git")
 	if _, err := os.Stat(cacheGitDir); err != nil {
 		if os.IsNotExist(err) {
@@ -221,7 +376,7 @@ func (b *Builder) build(fullName, name, cloneURL, commit, tag string) error {
 	}
 
 	// Set the full Docker image name.
-	image := fmt.Sprintf("%s/%s:%s", b.registryPrefix, name, tag)
+	image := fmt.Sprintf("%s/%s:%s", b.config.RegistryPrefix, repository, tag)
 
 	// Try the Docker build.
 	if err := Exec(cacheDir, nil, "docker", "build", "-t", image, "."); err != nil {
@@ -275,62 +430,47 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Start a Go routine to handle the build.
-	go func() {
+	go b.Build(p.Pusher.Name, p.Repository.Owner.Name, p.Repository.Name, p.Branch(), p.HeadCommit.ID, tag)
 
-		text := fmt.Sprintf("*<%s|%s>*:%s (<%s|%s>) → :package: *%s*:staging", p.Repository.URL, p.Repository.FullName, p.Branch(), p.HeadCommit.URL, p.HeadCommit.ID[:10], p.Repository.Name)
+	// Since we've accepted the build request but have nothing to report, return
+	// a 202 (Accepted).
+	w.WriteHeader(202)
+}
 
-		messageRecieved := NewMessage()
-		messageRecieved.Text = text
+func (b *Builder) ServeBuild(w http.ResponseWriter, r *http.Request) {
 
-		fmt.Sprintf("Recieved a build request based on a push from _%s_.", p.Pusher.Name)
+	// Get the user and repository values from mux.
+	vars := mux.Vars(r)
+	user := vars["user"]
+	repository := vars["repository"]
 
-		messageRecievedAttatchment := NewAttatchment()
-		messageRecievedAttatchment.Fallback = fmt.Sprintf("Recieved a build request based on a push from %s.", p.Pusher.Name)
-		messageRecievedAttatchment.Text = fmt.Sprintf("Recieved a build request based on a push from _%s_.", p.Pusher.Name)
-		messageRecievedAttatchment.MarkdownIn = []string{"text"}
+	// Check that the owner of the repository is allowed to have builds run.
+	// Return a 401 (Unauthorized) if they are not.
+	if !b.userAllowed(user) {
+		w.WriteHeader(401)
+		return
+	}
 
-		messageRecieved.Attatch(messageRecievedAttatchment)
-		if err := messageRecieved.Send(b.slackURL); err != nil {
-			fmt.Printf("error: %s\n", err.Error())
-		}
+	// Get the pusher, branch and commit values from the query.
+	query := r.URL.Query()
+	pusher := query.Get("pusher")
+	branch := query.Get("branch")
+	commit := query.Get("commit")
 
-		// Run the build.
-		if err := b.build(p.Repository.FullName, p.Repository.Name, p.Repository.SSHURL, p.HeadCommit.ID, tag); err != nil {
+	// Check whether or not this is a buildable branch.
+	var tag string
+	switch branch {
+	case "master":
+		tag = "latest"
+	case "develop":
+		tag = "staging"
+	default:
+		w.WriteHeader(200)
+		return
+	}
 
-			messageError := NewMessage()
-			messageError.Text = text
-
-			if execErr, ok := err.(ExecError); ok {
-				messageError.Attatch(execErr.Attatchment())
-			} else {
-				messageErrorAttatchment := NewAttatchment()
-				messageErrorAttatchment.Fallback = err.Error()
-				messageErrorAttatchment.Text = fmt.Sprintf("_%s_", err.Error())
-				messageErrorAttatchment.Color = "danger"
-				messageErrorAttatchment.MarkdownIn = []string{"text"}
-				messageError.Attatch(messageErrorAttatchment)
-			}
-			if err := messageError.Send(b.slackURL); err != nil {
-				fmt.Printf("error: %s\n", err.Error())
-			}
-		} else {
-
-			// Note that the build was successful.
-			messageSuccess := NewMessage()
-			messageSuccess.Text = text
-
-			messageSuccessAttatchment := NewAttatchment()
-			messageSuccessAttatchment.Fallback = fmt.Sprintf("Successfully processed a build request based on a push from %s!", p.Pusher.Name)
-			messageSuccessAttatchment.Text = fmt.Sprintf("Successfully processed a build request based on a push from _%s_!", p.Pusher.Name)
-			messageSuccessAttatchment.Color = "good"
-			messageSuccessAttatchment.MarkdownIn = []string{"text"}
-
-			messageSuccess.Attatch(messageSuccessAttatchment)
-			if err := messageSuccess.Send(b.slackURL); err != nil {
-				fmt.Printf("error: %s\n", err.Error())
-			}
-		}
-	}()
+	// Start a Go routine to handle the build.
+	go b.Build(pusher, user, repository, branch, commit, tag)
 
 	// Since we've accepted the build request but have nothing to report, return
 	// a 202 (Accepted).
@@ -367,7 +507,7 @@ func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send the message.
-	if err := message.Send(b.slackURL); err != nil {
+	if err := message.Send(b.config.SlackURL); err != nil {
 		log.Println(err)
 	}
 }

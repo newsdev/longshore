@@ -34,3 +34,4 @@ end
 
 package :git, 'github.com/go-mgo/mgo', 'c6a7dce14133ccac2dcac3793f1d6e2ef048503a'
 package :git, 'github.com/gorilla/mux', '8096f47503459bcc74d1f4c487b7e6e42e5746b5'
+package :git, 'github.com/gorilla/context', '215affda49addc4c8ef7e2534915df2c8c35c6cd'
