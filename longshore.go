@@ -113,7 +113,7 @@ func main() {
 
 		// Build a sub-router for POST endpoints.
 		p := r.Methods("POST").Subrouter()
-		p.HandleFunc("/{user}/{repository}", b.ServeWebhook).Headers("X-GitHub-Event", "push")
+		p.HandleFunc("/{user}/{repository}", b.ServeWebhook)
 
 		// Build a sub-router for GET endpoints.
 		g := r.Methods("GET").Subrouter()
