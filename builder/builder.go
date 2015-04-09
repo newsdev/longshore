@@ -33,6 +33,30 @@ const (
 `
 )
 
+func sendBson(iter *mgo.Iter, w http.ResponseWriter) {
+
+	var result []bson.M
+	if err := iter.All(&result); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	resultObject := bson.M{"result": result}
+	resultBytes, err := json.Marshal(resultObject)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if _, err := w.Write(resultBytes); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+}
+
 type Config struct {
 	CachePath, KeyPath, RegistryPrefix, SlackURL string
 	Users, Branches                              []string
@@ -334,6 +358,37 @@ func (b *Builder) build(user, repository, commit, tag string) error {
 		return err
 	}
 
+	// Open the Longfile. If there isn't one, we need to return an error
+	// anyway.
+	longfile, err := os.Open(filepath.Join(cacheDir, "Longfile"))
+	if err != nil {
+		return err
+	}
+
+	longfile_bytes, err := ioutil.ReadAll(longfile)
+	if err != nil {
+		return err
+	}
+
+	var longfile_data map[string]string
+	json.Unmarshal(longfile_bytes, longfile_data)
+	longfile_bson, err := bson.Marshal(longfile_data)
+	if err != nil {
+		return err
+	}
+
+	if b.mongoDBSession != nil {
+		session := b.mongoDBSession.Copy()
+
+		if _, err := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Upsert(bson.M{
+			"name": longfile_data["name"],
+		}, longfile_bson); err != nil {
+			log.Println(err)
+		}
+
+		session.Close()
+	}
+
 	// Open the Dockerfile. If there isn't one, we need to return an error
 	// anyway.
 	dockerfile, err := os.Open(filepath.Join(cacheDir, "Dockerfile"))
@@ -437,6 +492,33 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(202)
 }
 
+func (b *Builder) ServeApps(w http.ResponseWriter, r *http.Request) {
+
+	// Get the user and repository values from mux.
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Find(bson.M{}).Iter()
+
+	sendBson(iter, w)
+}
+
+func (b *Builder) ServeRepos(w http.ResponseWriter, r *http.Request) {
+
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	// Get the user and repository values from mux.
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("repos").Find(bson.M{
+		"app_name": name,
+	}).Iter()
+
+	sendBson(iter, w)
+}
+
 func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
 
 	// Get the user and repository values from mux.
@@ -452,25 +534,27 @@ func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
 		"repository": repository,
 	}).Sort("-updated").Limit(20).Iter()
 
-	var result []bson.M
-	if err := iter.All(&result); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
+	sendBson(iter, w)
+}
 
-	resultBytes, err := json.Marshal(result)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
+func (b *Builder) ServeServices(w http.ResponseWriter, r *http.Request) {
 
-	if _, err := w.Write(resultBytes); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
+	// Get the user and repository values from mux.
+	vars := mux.Vars(r)
+	name := vars["name"]
+	user := vars["user"]
+	repository := vars["repository"]
+
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("services").Find(bson.M{
+		"user":       user,
+		"repository": repository,
+		"app_name":   name,
+	}).Iter()
+
+	sendBson(iter, w)
 }
 
 func (b *Builder) ServeBuild(w http.ResponseWriter, r *http.Request) {
