@@ -124,6 +124,8 @@ func main() {
 		g.HandleFunc("/apps/{name}/{user}/{repository}/builds", b.ServeBuilds)
 		g.HandleFunc("/apps/{name}/{user}/{repository}/services", b.ServeServices)
 
+		g.HandleFunc("/build/{user}/{repository}", b.ServeBuild)
+
 		server := &http.Server{Addr: Config.WebhookAddress, Handler: r}
 		errs <- server.ListenAndServe()
 	}()

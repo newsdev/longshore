@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -33,29 +34,10 @@ const (
 `
 )
 
-func sendBson(iter *mgo.Iter, w http.ResponseWriter) {
-
-	var result []bson.M
-	if err := iter.All(&result); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
-
-	resultObject := bson.M{"result": result}
-	resultBytes, err := json.Marshal(resultObject)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
-
-	if _, err := w.Write(resultBytes); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
-}
+var (
+	AppNameMissingError   = errors.New("missing app name")
+	MongoDBSessionMissing = errors.New("no MongoDB session information was provided")
+)
 
 type Config struct {
 	CachePath, KeyPath, RegistryPrefix, SlackURL string
@@ -81,20 +63,67 @@ func NewBuilder(config *Config) (*Builder, error) {
 			return nil, err
 		}
 
-		buildsCollection := session.DB(b.config.MongoDBDialInfo.Database).C("builds")
+		b.mongoDBSession = session
 
-		buildSortIndex := mgo.Index{
-			Key: []string{"-updated", "user", "repository", "branch"},
+		allIndicies := map[string][]mgo.Index{
+			"builds": []mgo.Index{
+				mgo.Index{
+					Key: []string{"-updated", "app_name", "repository_user", "repository_name", "branch"},
+				},
+			},
+			"apps": []mgo.Index{
+				mgo.Index{
+					Key:    []string{"name"},
+					Unique: true,
+				},
+			},
+			"repositories": []mgo.Index{
+				mgo.Index{
+					Key: []string{"app_name"},
+				},
+				mgo.Index{
+					Key:    []string{"app_name", "user", "name"},
+					Unique: true,
+				},
+			},
+			"services": []mgo.Index{
+				mgo.Index{
+					Key:    []string{"app_name", "repository_user", "repository_name", "name", "environment"},
+					Unique: true,
+				},
+			},
 		}
 
-		if err := buildsCollection.EnsureIndex(buildSortIndex); err != nil {
+		if err := b.mongodbDo(func(db *mgo.Database) error {
+			for collection, indicies := range allIndicies {
+				for _, index := range indicies {
+					if err := db.C(collection).EnsureIndex(index); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-
-		b.mongoDBSession = session
 	}
 
 	return b, nil
+}
+
+func (b *Builder) mongodbDo(action func(*mgo.Database) error) error {
+
+	// Make sure there is a root session.
+	if b.mongoDBSession == nil {
+		return MongoDBSessionMissing
+	}
+
+	// Get a new session and defer its closing.
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	// Run the action, returning any error.
+	return action(session.DB(b.config.MongoDBDialInfo.Database))
 }
 
 func (b *Builder) userAllowed(user string) bool {
@@ -189,23 +218,19 @@ func (b *Builder) Build(pusher, user, repository, branch, commit, tag string) {
 	repositoryURL := fmt.Sprintf("https://github.com:%s/%s", user, repository)
 	commitURL := fmt.Sprintf("https://github.com:%s/%s/commit", user, repository, commit)
 
-	if b.mongoDBSession != nil {
-		session := b.mongoDBSession.Copy()
-
-		if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
-			"pusher":     pusher,
-			"tag":        tag,
-			"status":     "pending",
-			"user":       user,
-			"repository": repository,
-			"branch":     repository,
-			"commit":     commit,
-			"updated":    time.Now(),
-		}); err != nil {
-			log.Println(err)
-		}
-
-		session.Close()
+	if err := b.mongodbDo(func(db *mgo.Database) error {
+		return db.C("builds").Insert(bson.M{
+			"branch":          branch,
+			"commit":          commit,
+			"pusher":          pusher,
+			"repository_name": repository,
+			"status":          "pending",
+			"tag":             tag,
+			"updated":         time.Now(),
+			"repository_user": user,
+		})
+	}); err != nil {
+		log.Println(err)
 	}
 
 	text := fmt.Sprintf("*<%s|%s/%s>*:%s (<%s|%s>) → :package: *%s*:%s", repositoryURL, user, repository, branch, commitURL, commit[:10], repository, tag)
@@ -225,33 +250,28 @@ func (b *Builder) Build(pusher, user, repository, branch, commit, tag string) {
 	}
 
 	// Run the build.
-	if err := b.build(user, repository, commit, tag); err != nil {
+	if err := b.build(user, repository, branch, commit, tag); err != nil {
 
-		// Note the error in MongoDB if necessary.
-		if b.mongoDBSession != nil {
-			session := b.mongoDBSession.Copy()
+		var errorOuput string
+		if execErr, ok := err.(ExecError); ok {
+			errorOuput = execErr.Output
+		}
 
-			var errorOuput string
-			if execErr, ok := err.(ExecError); ok {
-				errorOuput = execErr.Output
-			}
-
-			if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
-				"pusher":      pusher,
-				"tag":         tag,
-				"status":      "error",
-				"error":       err.Error(),
-				"errorOutput": errorOuput,
-				"user":        user,
-				"repository":  repository,
-				"branch":      repository,
-				"commit":      commit,
-				"updated":     time.Now(),
-			}); err != nil {
-				log.Println(err)
-			}
-
-			session.Close()
+		if err := b.mongodbDo(func(db *mgo.Database) error {
+			return db.C("builds").Insert(bson.M{
+				"pusher":          pusher,
+				"tag":             tag,
+				"status":          "error",
+				"error":           err.Error(),
+				"errorOutput":     errorOuput,
+				"repository_user": user,
+				"repository_name": repository,
+				"branch":          branch,
+				"commit":          commit,
+				"updated":         time.Now(),
+			})
+		}); err != nil {
+			log.Println(err)
 		}
 
 		messageError := NewMessage()
@@ -273,23 +293,19 @@ func (b *Builder) Build(pusher, user, repository, branch, commit, tag string) {
 	} else {
 
 		// Note the success in MongoDB if necessary.
-		if b.mongoDBSession != nil {
-			session := b.mongoDBSession.Copy()
-
-			if err := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Insert(bson.M{
-				"pusher":     pusher,
-				"tag":        tag,
-				"status":     "success",
-				"user":       user,
-				"repository": repository,
-				"branch":     repository,
-				"commit":     commit,
-				"updated":    time.Now(),
-			}); err != nil {
-				log.Println(err)
-			}
-
-			session.Close()
+		if err := b.mongodbDo(func(db *mgo.Database) error {
+			return db.C("builds").Insert(bson.M{
+				"pusher":          pusher,
+				"tag":             tag,
+				"status":          "success",
+				"repository_user": user,
+				"repository_name": repository,
+				"branch":          branch,
+				"commit":          commit,
+				"updated":         time.Now(),
+			})
+		}); err != nil {
+			log.Println(err)
 		}
 
 		// Note that the build was successful.
@@ -309,7 +325,7 @@ func (b *Builder) Build(pusher, user, repository, branch, commit, tag string) {
 	}
 }
 
-func (b *Builder) build(user, repository, commit, tag string) error {
+func (b *Builder) build(user, repository, branch, commit, tag string) error {
 
 	fullName := fmt.Sprintf("%s/%s", user, repository)
 	cloneURL := fmt.Sprintf("git@github.com:%s/%s.git", user, repository)
@@ -358,35 +374,113 @@ func (b *Builder) build(user, repository, commit, tag string) error {
 		return err
 	}
 
-	// Open the Longfile. If there isn't one, we need to return an error
-	// anyway.
-	longfile, err := os.Open(filepath.Join(cacheDir, "Longfile"))
-	if err != nil {
-		return err
-	}
+	// Check if we need to handle a Longfile.
+	longshorefile := filepath.Join(cacheDir, "Longshorefile")
+	if _, err := os.Stat(longshorefile); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	} else {
 
-	longfile_bytes, err := ioutil.ReadAll(longfile)
-	if err != nil {
-		return err
-	}
+		// Open the Longfile. If there isn't one, we need to return an error
+		// anyway.
+		longshorefileFile, err := os.Open(longshorefile)
+		if err != nil {
+			return err
+		}
 
-	var longfile_data map[string]string
-	json.Unmarshal(longfile_bytes, longfile_data)
-	longfile_bson, err := bson.Marshal(longfile_data)
-	if err != nil {
-		return err
-	}
+		longshorefileBytes, err := ioutil.ReadAll(longshorefileFile)
+		if err != nil {
+			return err
+		}
 
-	if b.mongoDBSession != nil {
-		session := b.mongoDBSession.Copy()
+		var longshorefileData map[string]string
+		json.Unmarshal(longshorefileBytes, &longshorefileData)
+		if len(longshorefileData["name"]) == 0 {
+			return AppNameMissingError
+		}
 
-		if _, err := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Upsert(bson.M{
-			"name": longfile_data["name"],
-		}, longfile_bson); err != nil {
+		if err := b.mongodbDo(func(db *mgo.Database) error {
+			_, err := db.C("apps").Upsert(
+				bson.M{
+					"name": longshorefileData["name"],
+				},
+				longshorefileData,
+			)
+			return err
+		}); err != nil {
 			log.Println(err)
 		}
 
-		session.Close()
+		if err := b.mongodbDo(func(db *mgo.Database) error {
+			_, err := db.C("repositories").Upsert(
+				bson.M{
+					"app_name": longshorefileData["name"],
+					"user":     user,
+					"name":     repository,
+				},
+				bson.M{
+					"app_name": longshorefileData["name"],
+					"user":     user,
+					"name":     repository,
+				},
+			)
+			return err
+		}); err != nil {
+			log.Println(err)
+		}
+
+		// Determine the services environment to use.
+		var servicesEnvironment string
+		log.Println(branch)
+		switch branch {
+		case "master":
+			servicesEnvironment = "prd"
+		case "develop":
+			servicesEnvironment = "stg"
+		}
+
+		// Check if we need to handle services.
+		servicesDir := filepath.Join(cacheDir, "services", servicesEnvironment)
+		if _, err := os.Stat(servicesDir); err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+		} else {
+
+			// List all of the service files in the given services directory.
+			serviceFiles, err := ioutil.ReadDir(filepath.Join(cacheDir, "services", servicesEnvironment))
+			if err != nil {
+				return err
+			}
+
+			if err := b.mongodbDo(func(db *mgo.Database) error {
+				for _, serviceFile := range serviceFiles {
+					serviceName := serviceFile.Name()
+					if _, err := db.C("services").Upsert(
+						bson.M{
+							"app_name":        longshorefileData["name"],
+							"name":            serviceName,
+							"environment":     servicesEnvironment,
+							"repository_user": user,
+							"repository_name": repository,
+						},
+						bson.M{
+							"app_name":        longshorefileData["name"],
+							"name":            serviceName,
+							"environment":     servicesEnvironment,
+							"repository_user": user,
+							"repository_name": repository,
+						},
+					); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				log.Println(err)
+			}
+		}
 	}
 
 	// Open the Dockerfile. If there isn't one, we need to return an error
@@ -498,9 +592,12 @@ func (b *Builder) ServeApps(w http.ResponseWriter, r *http.Request) {
 	session := b.mongoDBSession.Copy()
 	defer session.Close()
 
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Find(bson.M{}).Iter()
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Find(bson.M{}).Select(bson.M{"name": 1}).Iter()
 
-	sendBson(iter, w)
+	if err := writeAllAsResult(iter, w); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+	}
 }
 
 func (b *Builder) ServeRepos(w http.ResponseWriter, r *http.Request) {
@@ -512,29 +609,14 @@ func (b *Builder) ServeRepos(w http.ResponseWriter, r *http.Request) {
 	session := b.mongoDBSession.Copy()
 	defer session.Close()
 
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("repos").Find(bson.M{
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("repositories").Find(bson.M{
 		"app_name": name,
-	}).Iter()
+	}).Select(bson.M{"user": 1, "name": 1}).Iter()
 
-	sendBson(iter, w)
-}
-
-func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
-
-	// Get the user and repository values from mux.
-	vars := mux.Vars(r)
-	user := vars["user"]
-	repository := vars["repository"]
-
-	session := b.mongoDBSession.Copy()
-	defer session.Close()
-
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Find(bson.M{
-		"user":       user,
-		"repository": repository,
-	}).Sort("-updated").Limit(20).Iter()
-
-	sendBson(iter, w)
+	if err := writeAllAsResult(iter, w); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+	}
 }
 
 func (b *Builder) ServeServices(w http.ResponseWriter, r *http.Request) {
@@ -549,12 +631,36 @@ func (b *Builder) ServeServices(w http.ResponseWriter, r *http.Request) {
 	defer session.Close()
 
 	iter := session.DB(b.config.MongoDBDialInfo.Database).C("services").Find(bson.M{
-		"user":       user,
-		"repository": repository,
-		"app_name":   name,
-	}).Iter()
+		"app_name":        name,
+		"repository_user": user,
+		"repository_name": repository,
+	}).Select(bson.M{"name": 1, "environment": 1}).Iter()
 
-	sendBson(iter, w)
+	if err := writeAllAsResult(iter, w); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+	}
+}
+
+func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
+
+	// Get the user and repository values from mux.
+	vars := mux.Vars(r)
+	user := vars["user"]
+	repository := vars["repository"]
+
+	session := b.mongoDBSession.Copy()
+	defer session.Close()
+
+	iter := session.DB(b.config.MongoDBDialInfo.Database).C("builds").Find(bson.M{
+		"repository_user": user,
+		"repository_name": repository,
+	}).Sort("-updated").Limit(20).Iter()
+
+	if err := writeAllAsResult(iter, w); err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+	}
 }
 
 func (b *Builder) ServeBuild(w http.ResponseWriter, r *http.Request) {
