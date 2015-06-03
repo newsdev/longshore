@@ -118,13 +118,7 @@ func main() {
 		// Build a sub-router for GET endpoints.
 		g := r.Methods("GET").Subrouter()
 		g.HandleFunc("/status", status)
-
-		g.HandleFunc("/apps", b.ServeApps)
-		g.HandleFunc("/apps/{name}", b.ServeRepos)
-		g.HandleFunc("/apps/{name}/{user}/{repository}/builds", b.ServeBuilds)
-		g.HandleFunc("/apps/{name}/{user}/{repository}/services", b.ServeServices)
-
-		g.HandleFunc("/build/{user}/{repository}", b.ServeBuild)
+		g.HandleFunc("/api/builds/github.com/{user}/{repository}", b.ServeBuilds)
 
 		server := &http.Server{Addr: Config.WebhookAddress, Handler: r}
 		errs <- server.ListenAndServe()

@@ -35,7 +35,6 @@ const (
 )
 
 var (
-	AppNameMissingError   = errors.New("missing app name")
 	MongoDBSessionMissing = errors.New("no MongoDB session information was provided")
 )
 
@@ -68,28 +67,10 @@ func NewBuilder(config *Config) (*Builder, error) {
 		allIndicies := map[string][]mgo.Index{
 			"builds": []mgo.Index{
 				mgo.Index{
-					Key: []string{"-updated", "app_name", "repository_user", "repository_name", "branch"},
-				},
-			},
-			"apps": []mgo.Index{
-				mgo.Index{
-					Key:    []string{"name"},
-					Unique: true,
-				},
-			},
-			"repositories": []mgo.Index{
-				mgo.Index{
-					Key: []string{"app_name"},
+					Key: []string{"-updated", "owner", "name"},
 				},
 				mgo.Index{
-					Key:    []string{"app_name", "user", "name"},
-					Unique: true,
-				},
-			},
-			"services": []mgo.Index{
-				mgo.Index{
-					Key:    []string{"app_name", "repository_user", "repository_name", "name", "environment"},
-					Unique: true,
+					Key: []string{"-updated", "owner", "name", "branch"},
 				},
 			},
 		}
@@ -374,115 +355,6 @@ func (b *Builder) build(user, repository, branch, commit, tag string) error {
 		return err
 	}
 
-	// Check if we need to handle a Longfile.
-	longshorefile := filepath.Join(cacheDir, "Longshorefile")
-	if _, err := os.Stat(longshorefile); err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-	} else {
-
-		// Open the Longfile. If there isn't one, we need to return an error
-		// anyway.
-		longshorefileFile, err := os.Open(longshorefile)
-		if err != nil {
-			return err
-		}
-
-		longshorefileBytes, err := ioutil.ReadAll(longshorefileFile)
-		if err != nil {
-			return err
-		}
-
-		var longshorefileData map[string]string
-		json.Unmarshal(longshorefileBytes, &longshorefileData)
-		if len(longshorefileData["name"]) == 0 {
-			return AppNameMissingError
-		}
-
-		if err := b.mongodbDo(func(db *mgo.Database) error {
-			_, err := db.C("apps").Upsert(
-				bson.M{
-					"name": longshorefileData["name"],
-				},
-				longshorefileData,
-			)
-			return err
-		}); err != nil {
-			log.Println(err)
-		}
-
-		if err := b.mongodbDo(func(db *mgo.Database) error {
-			_, err := db.C("repositories").Upsert(
-				bson.M{
-					"app_name": longshorefileData["name"],
-					"user":     user,
-					"name":     repository,
-				},
-				bson.M{
-					"app_name": longshorefileData["name"],
-					"user":     user,
-					"name":     repository,
-				},
-			)
-			return err
-		}); err != nil {
-			log.Println(err)
-		}
-
-		// Determine the services environment to use.
-		var servicesEnvironment string
-		log.Println(branch)
-		switch branch {
-		case "master":
-			servicesEnvironment = "prd"
-		case "develop":
-			servicesEnvironment = "stg"
-		}
-
-		// Check if we need to handle services.
-		servicesDir := filepath.Join(cacheDir, "services", servicesEnvironment)
-		if _, err := os.Stat(servicesDir); err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-		} else {
-
-			// List all of the service files in the given services directory.
-			serviceFiles, err := ioutil.ReadDir(filepath.Join(cacheDir, "services", servicesEnvironment))
-			if err != nil {
-				return err
-			}
-
-			if err := b.mongodbDo(func(db *mgo.Database) error {
-				for _, serviceFile := range serviceFiles {
-					serviceName := serviceFile.Name()
-					if _, err := db.C("services").Upsert(
-						bson.M{
-							"app_name":        longshorefileData["name"],
-							"name":            serviceName,
-							"environment":     servicesEnvironment,
-							"repository_user": user,
-							"repository_name": repository,
-						},
-						bson.M{
-							"app_name":        longshorefileData["name"],
-							"name":            serviceName,
-							"environment":     servicesEnvironment,
-							"repository_user": user,
-							"repository_name": repository,
-						},
-					); err != nil {
-						return err
-					}
-				}
-				return nil
-			}); err != nil {
-				log.Println(err)
-			}
-		}
-	}
-
 	// Open the Dockerfile. If there isn't one, we need to return an error
 	// anyway.
 	dockerfile, err := os.Open(filepath.Join(cacheDir, "Dockerfile"))
@@ -586,62 +458,6 @@ func (b *Builder) ServeWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(202)
 }
 
-func (b *Builder) ServeApps(w http.ResponseWriter, r *http.Request) {
-
-	// Get the user and repository values from mux.
-	session := b.mongoDBSession.Copy()
-	defer session.Close()
-
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("apps").Find(bson.M{}).Select(bson.M{"name": 1}).Iter()
-
-	if err := writeAllAsResult(iter, w); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-	}
-}
-
-func (b *Builder) ServeRepos(w http.ResponseWriter, r *http.Request) {
-
-	vars := mux.Vars(r)
-	name := vars["name"]
-
-	// Get the user and repository values from mux.
-	session := b.mongoDBSession.Copy()
-	defer session.Close()
-
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("repositories").Find(bson.M{
-		"app_name": name,
-	}).Select(bson.M{"user": 1, "name": 1}).Iter()
-
-	if err := writeAllAsResult(iter, w); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-	}
-}
-
-func (b *Builder) ServeServices(w http.ResponseWriter, r *http.Request) {
-
-	// Get the user and repository values from mux.
-	vars := mux.Vars(r)
-	name := vars["name"]
-	user := vars["user"]
-	repository := vars["repository"]
-
-	session := b.mongoDBSession.Copy()
-	defer session.Close()
-
-	iter := session.DB(b.config.MongoDBDialInfo.Database).C("services").Find(bson.M{
-		"app_name":        name,
-		"repository_user": user,
-		"repository_name": repository,
-	}).Select(bson.M{"name": 1, "environment": 1}).Iter()
-
-	if err := writeAllAsResult(iter, w); err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-	}
-}
-
 func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
 
 	// Get the user and repository values from mux.
@@ -661,46 +477,6 @@ func (b *Builder) ServeBuilds(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		w.WriteHeader(500)
 	}
-}
-
-func (b *Builder) ServeBuild(w http.ResponseWriter, r *http.Request) {
-
-	// Get the user and repository values from mux.
-	vars := mux.Vars(r)
-	user := vars["user"]
-	repository := vars["repository"]
-
-	// Check that the owner of the repository is allowed to have builds run.
-	// Return a 401 (Unauthorized) if they are not.
-	if !b.userAllowed(user) {
-		w.WriteHeader(401)
-		return
-	}
-
-	// Get the pusher, branch and commit values from the query.
-	query := r.URL.Query()
-	pusher := query.Get("pusher")
-	branch := query.Get("branch")
-	commit := query.Get("commit")
-
-	// Check whether or not this is a buildable branch.
-	var tag string
-	switch branch {
-	case "master":
-		tag = "latest"
-	case "develop":
-		tag = "staging"
-	default:
-		w.WriteHeader(200)
-		return
-	}
-
-	// Start a Go routine to handle the build.
-	go b.Build(pusher, user, repository, branch, commit, tag)
-
-	// Since we've accepted the build request but have nothing to report, return
-	// a 202 (Accepted).
-	w.WriteHeader(202)
 }
 
 func (b *Builder) ServeKey(w http.ResponseWriter, r *http.Request) {
